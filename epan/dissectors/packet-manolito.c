@@ -15,7 +15,6 @@
 
 #include <epan/packet.h>
 #include <epan/expert.h>
-#include <epan/prefs.h>
 
 void proto_register_manolito(void);
 void proto_reg_handoff_manolito(void);
@@ -43,18 +42,13 @@ static int ett_manolito;
 static expert_field ei_manolito_type;
 static expert_field ei_manolito_checksum_bad;
 
-/* The sender converts its ANSI string to Unicode (VB6 StrConv(s, vbUnicode))
- * before checksumming, so the result depends on the sender's code page.
- * The pages differ in 0x80..0x9f for all of them, and 0xa0..0xff differs for
- * the non-Western pages, so the checksum depends on the sender's locale. */
-enum manolito_ansi_page {
-	MANOLITO_CP1252 = 0,	/* Western European (default) */
-	MANOLITO_CP1250,	/* Central European */
-	MANOLITO_CP1251,	/* Cyrillic */
-	MANOLITO_LATIN1		/* ISO-8859-1, no 0x80..0x9f remapping */
-};
-
-static int pref_ansi_page = MANOLITO_CP1252;
+/* The sender converts its ANSI message to Unicode (VB6 StrConv(s, vbUnicode))
+ * before checksumming, so every byte >= 0x80 hashes as the UTF-16LE code unit
+ * of its code-page character.  The conversion uses the *sender's* Windows ANSI
+ * code page: 20523 of 20528 corpus frames reproduce under Windows-1252; the
+ * exceptions were single frames from a CP1250 (Polish) and a CP1255 (Israeli)
+ * sender.  This dissector always computes Windows-1252, so packets from
+ * clients on other code pages show a bad checksum. */
 
 #define MANOLITO_STRING  1
 #define MANOLITO_INTEGER 0
@@ -92,13 +86,6 @@ static const value_string manolito_checksum_status[] = {
 	{ 0, NULL }
 };
 
-static const value_string manolito_ansi_page_vals[] = {
-	{ MANOLITO_CP1252, "Windows-1252 (Western European, default)" },
-	{ MANOLITO_CP1250, "Windows-1250 (Central European)" },
-	{ MANOLITO_CP1251, "Windows-1251 (Cyrillic)" },
-	{ MANOLITO_LATIN1, "ISO-8859-1 (no 0x80..0x9f remapping)" },
-	{ 0, NULL }
-};
 /* --- manolito checksum core: begin --- */
 
 /* CRC-16/CCITT: poly 0x1021, MSB first, init 0, no final xor. */
@@ -120,10 +107,9 @@ manolito_crc16_byte(uint16_t crc, uint8_t byte)
 	return crc;
 }
 
-/* Code page tables.  CP1252 agrees with Unicode for 0xa0..0xff, so only its
- * C1 range needs a table; CP1250 and CP1251 differ across 0x80..0xff.  Bytes
- * that the code page leaves undefined keep their value, which is what
- * MultiByteToWideChar() does for these pages. */
+/* Windows-1252 agrees with Latin-1 for 0xa0..0xff, so only its C1 range needs
+ * a table.  Bytes the code page leaves undefined keep their value, which is
+ * what MultiByteToWideChar() does for them. */
 static const uint16_t manolito_c1_cp1252[32] = {
 	0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
 	0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
@@ -131,72 +117,26 @@ static const uint16_t manolito_c1_cp1252[32] = {
 	0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
 };
 
-static const uint16_t manolito_high_cp1250[128] = {
-	0x20AC, 0x0081, 0x201A, 0x0083, 0x201E, 0x2026, 0x2020, 0x2021,
-	0x0088, 0x2030, 0x0160, 0x2039, 0x015A, 0x0164, 0x017D, 0x0179,
-	0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-	0x0098, 0x2122, 0x0161, 0x203A, 0x015B, 0x0165, 0x017E, 0x017A,
-	0x00A0, 0x02C7, 0x02D8, 0x0141, 0x00A4, 0x0104, 0x00A6, 0x00A7,
-	0x00A8, 0x00A9, 0x015E, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x017B,
-	0x00B0, 0x00B1, 0x02DB, 0x0142, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
-	0x00B8, 0x0105, 0x015F, 0x00BB, 0x013D, 0x02DD, 0x013E, 0x017C,
-	0x0154, 0x00C1, 0x00C2, 0x0102, 0x00C4, 0x0139, 0x0106, 0x00C7,
-	0x010C, 0x00C9, 0x0118, 0x00CB, 0x011A, 0x00CD, 0x00CE, 0x010E,
-	0x0110, 0x0143, 0x0147, 0x00D3, 0x00D4, 0x0150, 0x00D6, 0x00D7,
-	0x0158, 0x016E, 0x00DA, 0x0170, 0x00DC, 0x00DD, 0x0162, 0x00DF,
-	0x0155, 0x00E1, 0x00E2, 0x0103, 0x00E4, 0x013A, 0x0107, 0x00E7,
-	0x010D, 0x00E9, 0x0119, 0x00EB, 0x011B, 0x00ED, 0x00EE, 0x010F,
-	0x0111, 0x0144, 0x0148, 0x00F3, 0x00F4, 0x0151, 0x00F6, 0x00F7,
-	0x0159, 0x016F, 0x00FA, 0x0171, 0x00FC, 0x00FD, 0x0163, 0x02D9
-};
-
-static const uint16_t manolito_high_cp1251[128] = {
-	0x0402, 0x0403, 0x201A, 0x0453, 0x201E, 0x2026, 0x2020, 0x2021,
-	0x20AC, 0x2030, 0x0409, 0x2039, 0x040A, 0x040C, 0x040B, 0x040F,
-	0x0452, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-	0x0098, 0x2122, 0x0459, 0x203A, 0x045A, 0x045C, 0x045B, 0x045F,
-	0x00A0, 0x040E, 0x045E, 0x0408, 0x00A4, 0x0490, 0x00A6, 0x00A7,
-	0x0401, 0x00A9, 0x0404, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x0407,
-	0x00B0, 0x00B1, 0x0406, 0x0456, 0x0491, 0x00B5, 0x00B6, 0x00B7,
-	0x0451, 0x2116, 0x0454, 0x00BB, 0x0458, 0x0405, 0x0455, 0x0457,
-	0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417,
-	0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E, 0x041F,
-	0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427,
-	0x0428, 0x0429, 0x042A, 0x042B, 0x042C, 0x042D, 0x042E, 0x042F,
-	0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437,
-	0x0438, 0x0439, 0x043A, 0x043B, 0x043C, 0x043D, 0x043E, 0x043F,
-	0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447,
-	0x0448, 0x0449, 0x044A, 0x044B, 0x044C, 0x044D, 0x044E, 0x044F
-};
-
 static uint16_t
-manolito_ansi_to_unicode(uint8_t b, int page)
+manolito_cp1252_to_unicode(uint8_t b)
 {
-	if (b < 0x80)
-		return b;
+	if (b >= 0x80 && b <= 0x9f)
+		return manolito_c1_cp1252[b - 0x80];
 
-	switch (page) {
-	case MANOLITO_CP1250:
-		return manolito_high_cp1250[b - 0x80];
-	case MANOLITO_CP1251:
-		return manolito_high_cp1251[b - 0x80];
-	case MANOLITO_LATIN1:
-		return b;
-	default:
-		return (b <= 0x9f) ? manolito_c1_cp1252[b - 0x80] : b;
-	}
+	return b;	/* ASCII and Latin-1 range: identity */
 }
 
 /* Checksum of an ANSI message: the CRC runs over the UTF-16LE bytes of the
- * Unicode string the sender built, i.e. every byte contributes two bytes. */
+ * Windows-1252 string the sender built, i.e. every byte contributes two
+ * bytes. */
 static uint16_t
-manolito_checksum_buf(const uint8_t *buf, unsigned len, int page)
+manolito_checksum_buf(const uint8_t *buf, unsigned len)
 {
 	uint16_t crc = MANOLITO_CRC16_INIT;
 	unsigned i;
 
 	for (i = 0; i < len; i++) {
-		uint16_t u = manolito_ansi_to_unicode(buf[i], page);
+		uint16_t u = manolito_cp1252_to_unicode(buf[i]);
 
 		crc = manolito_crc16_byte(crc, (uint8_t)(u & 0x00ff));
 		crc = manolito_crc16_byte(crc, (uint8_t)(u >> 8));
@@ -231,7 +171,7 @@ dissect_manolito(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* diss
 		if (plen > 4) {
 			uint8_t *msg = (uint8_t *)tvb_memdup(pinfo->pool, tvb, 4, plen - 4);
 
-			computed = manolito_checksum_buf(msg, plen - 4, pref_ansi_page);
+			computed = manolito_checksum_buf(msg, plen - 4);
 		}
 
 		proto_tree_add_checksum(manolito_tree, tvb, offset, hf_manolito_checksum,
@@ -448,7 +388,6 @@ proto_register_manolito(void)
 	};
 
 	expert_module_t* expert_manolito;
-	module_t *manolito_module;
 
 	proto_manolito = proto_register_protocol("Blubster/Piolet MANOLITO Protocol", "Manolito", "manolito");
 
@@ -456,13 +395,6 @@ proto_register_manolito(void)
 	proto_register_subtree_array(ett, array_length(ett));
 	expert_manolito = expert_register_protocol(proto_manolito);
 	expert_register_field_array(expert_manolito, ei, array_length(ei));
-
-	manolito_module = prefs_register_protocol(proto_manolito, NULL);
-	prefs_register_enum_preference(manolito_module, "ansi_code_page",
-	    "ANSI code page of the sender",
-	    "Code page Blubster used to convert the message to Unicode before "
-	    "checksumming.  Only matters for bytes >= 0x80.",
-	    &pref_ansi_page, manolito_ansi_page_vals, false);
 
 	manolito_handle = register_dissector("manolito", dissect_manolito, proto_manolito);
 }
